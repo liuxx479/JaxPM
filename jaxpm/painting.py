@@ -31,11 +31,11 @@ def cic_paint(mesh, positions, halo_size=0, sharding_info=None):
         with sharding_info.mesh:
             mesh = slice_pad(mesh ,padding_width , sharding_info.pdims)
 
-            positions = add_halo(positions , padding_width , sharding_info.pdims)
+            positions = add_halo(positions , halo_size)
 
     with sharding_info.mesh:
         positions = jnp.expand_dims(positions, 1)
-        floor = jnp.floor(positions)
+        floor = jax.jit(jnp.floor)(positions)
 
     connection = jnp.array([[[0, 0, 0], [1., 0, 0], [0., 1, 0],
                              [0., 0, 1], [1., 1, 0], [1., 0, 1],
@@ -47,7 +47,7 @@ def cic_paint(mesh, positions, halo_size=0, sharding_info=None):
         return (kernel[..., 0] * kernel[..., 1] * kernel[..., 2])
 
     with sharding_info.mesh:
-        neighboor_coords = jnp.add(floor , connection)
+        neighboor_coords = jax.jit(jnp.add)(floor , connection)
         kernel = compute_kernels(positions , neighboor_coords)
 
         neighboor_coords = jnp.mod(neighboor_coords.reshape(
@@ -94,7 +94,7 @@ def cic_read(mesh, positions, halo_size=0, sharding_info=None):
             padding_width = ((halo_size, halo_size), (halo_size, halo_size), (0, 0))
             mesh = slice_pad(mesh, padding_width , sharding_info.pdims)
             mesh = halo_exchange(mesh,
-                            halo_extents=sharding_info.halo_extents,
+                                halo_extents=sharding_info.halo_extents,
                                 halo_periods=(True,True,True))
             positions = add_halo(positions , halo_size)
 

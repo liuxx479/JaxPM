@@ -52,13 +52,9 @@ def run_sim(initial_conditions, cosmo, sharding_info=None):
     #             [pos+dx, p], jnp.linspace(0.1, 1.0, 2), cosmo,
     #             rtol=1e-3, atol=1e-3)
     ## Painting on a new mesh
-    with sharding_info.mesh:
-        displacement = jit(jnp.add)(p , dx)
-
     empty_field = zeros(mesh_shape, sharding_info=sharding_info)
-
     field = cic_paint(empty_field,
-                displacement, halo_size, sharding_info=sharding_info)
+                jnp.add(p , dx), halo_size, sharding_info=sharding_info)
 
     return init_field, field
 

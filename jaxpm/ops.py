@@ -76,7 +76,7 @@ def meshgrid3d(shape, sharding_info=None):
 
     return jnp.stack(jnp.meshgrid(*coords), axis=-1).reshape([-1, 3])
 
-def zeros(mesh , shape, sharding_info=None):
+def zeros(shape, sharding_info=None):
     """ Initialize an array of given global shape
     partitionned if need be accross dimensions.
     """
@@ -86,7 +86,7 @@ def zeros(mesh , shape, sharding_info=None):
     zeros_slice = jnp.zeros([sharding_info.global_shape[0]//sharding_info.pdims[1], \
         sharding_info.global_shape[1]//sharding_info.pdims[0]]+list(sharding_info.global_shape[2:]))
 
-    gspmd_zeros = multihost_utils.host_local_array_to_global_array(zeros_slice ,mesh, P('z' , 'y'))
+    gspmd_zeros = multihost_utils.host_local_array_to_global_array(zeros_slice ,sharding_info.mesh, P('z' , 'y'))
     return gspmd_zeros
 
 
