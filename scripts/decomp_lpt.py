@@ -1,3 +1,4 @@
+# Execute with `mpirun -n 4 python decomp_lpt.py`
 import jax
 
 import jax.numpy as jnp
