@@ -149,8 +149,6 @@ def forward_fn(z, kvec, pos, a):
     cosmo = jc.Planck15()
     a = jnp.atleast_1d(a)
     dx = growth_factor(cosmo, a) * initial_force
-    p = a**2 * growth_rate(cosmo, a) * jnp.sqrt(jc.background.Esqr(cosmo, a)) * dx
-    f = a**2 * jnp.sqrt(jc.background.Esqr(cosmo, a)) * dGfa(cosmo, a) * initial_force
 
     # Painting resulting particles
     field = cic_paint(jax.numpy.zeros_like(z), pos+dx)
@@ -159,7 +157,9 @@ def forward_fn(z, kvec, pos, a):
 
 with mesh:
     initial_conds, field= forward_fn(z, kvec, pos, a=1.)
-    # Measuring how long it takes to run
+    field.block_until_ready()
+    
+    # Measuring how long it takes to run after the first call
     start = time.time()
     initial_conds, field = forward_fn(z, kvec, pos, a=1.)
     field.block_until_ready()
@@ -167,10 +167,6 @@ with mesh:
 
 print('success in', end-start, 'seconds')
 
-# Retrieve the results
-gathered_initial_conditions = multihost_utils.process_allgather(initial_conds, tiled=True)
-gathered_field = multihost_utils.process_allgather(field, tiled=True)
-
-if rank == 0:
-    np.save('./field.npy', gathered_field)
-    np.save('./initial_conditions.npy', gathered_initial_conditions)
+# Saving results
+np.save(f'./field_{rank}.npy', field.addressable_data(0))
+np.save(f'./initial_conditions_{rank}.npy', initial_conds.addressable_data(0))
