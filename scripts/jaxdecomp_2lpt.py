@@ -172,8 +172,8 @@ master_key = jax.random.PRNGKey(42)
 key = jax.random.split(master_key, size)[rank]
 
 pdims = (2 , 2)
-mesh_shape = [2048, 2048, 2048]
-box_size = [2048, 2048, 2048]  # Mpc/h
+mesh_shape = [1024, 1024, 1024]
+box_size = [1024, 1024, 1024]  # Mpc/h
 
 halo_size = 16
 
