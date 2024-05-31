@@ -1,18 +1,9 @@
-# Execute with `mpirun -n 4 python decomp_lptv2.py`
-# Works under jaxdecomp v0.0.1rc3
-# Enable jax
-# import jax
-import subprocess
-import os
-#from mpi4py import MPI
-#comm = MPI.COMM_WORLD
-#hostname = MPI.Get_processor_name()
-#hostnames = comm.gather(hostname)
-#rank = comm.Get_rank()
-
 import jax
 
 jax.config.update("jax_enable_x64", True)
+
+from jax.experimental.ode import odeint
+
 import jaxdecomp
 
 #jax.distributed.initialize(
@@ -127,6 +118,23 @@ def enmesh(i1, d1, a1, s1, b12, a2, s2):
     return i2, f2
 
 
+def _scatter_chunk(carry, chunk):
+    mesh, offset, cell_size = carry
+    pmid, disp, val = chunk
+    spatial_ndim = pmid.shape[1]
+    spatial_shape = mesh.shape
+
+    # multilinear mesh indices and fractions
+    ind, frac = enmesh(pmid, disp, cell_size, mesh_shape, offset, cell_size,
+                       spatial_shape)
+    # scatter
+    ind = tuple(ind[..., i] for i in range(spatial_ndim))
+    mesh = mesh.at[ind].add(val * frac)
+
+    carry = mesh, offset, cell_size
+    return carry, None
+
+
 def scatter(pmid,
             disp,
             mesh,
@@ -146,23 +154,6 @@ def scatter(pmid,
     carry = scan(_scatter_chunk, carry, chunks)[0]
     mesh = carry[0]
     return mesh
-
-
-def _scatter_chunk(carry, chunk):
-    mesh, offset, cell_size = carry
-    pmid, disp, val = chunk
-    spatial_ndim = pmid.shape[1]
-    spatial_shape = mesh.shape
-
-    # multilinear mesh indices and fractions
-    ind, frac = enmesh(pmid, disp, cell_size, mesh_shape, offset, cell_size,
-                       spatial_shape)
-    # scatter
-    ind = tuple(ind[..., i] for i in range(spatial_ndim))
-    mesh = mesh.at[ind].add(val * frac)
-
-    carry = mesh, offset, cell_size
-    return carry, None
 
 
 def lpt2_source(lineark_laplace, kvec):
@@ -199,10 +190,10 @@ def lpt2_source(lineark_laplace, kvec):
 master_key = jax.random.PRNGKey(42)
 key = jax.random.split(master_key, size)[rank]
 
-pdims = (2 , 2)
+pdims = (2, 2)
 mesh_shape = [512, 512, 512]
 box_size = [200., 200., 200.]  # Mpc/h
-
+snapshots = jnp.linspace(0.1, 1.0, 2)
 halo_size = 0
 lpt2 = True
 # Create computing mesgh
@@ -220,6 +211,14 @@ z = jax.make_array_from_single_device_arrays(
     shape=mesh_shape,
     sharding=sharding,
     arrays=[jax.random.normal(key, local_mesh_shape, dtype='float32')])
+
+pos = jax.make_array_from_callback(
+    shape=tuple(mesh_shape + [3]),
+    sharding=sharding,
+    data_callback=lambda x: jnp.stack(jnp.meshgrid(
+        jnp.arange(mesh_shape[1])[x[1]],
+        jnp.arange(mesh_shape[2])[x[0]], jnp.arange(mesh_shape[0])),
+                                      axis=-1))
 
 kd = np.fft.fftfreq(mesh_shape[0]).astype('float32') * 2 * np.pi
 kvec = [
@@ -252,6 +251,74 @@ def cic_paint(displacement):
     pmid = jnp.stack([b + halo_size, a + halo_size, c], axis=-1)
     pmid = pmid.reshape([-1, 3])
     return scatter(pmid, displacement.reshape([-1, 3]), mesh)
+
+
+@partial(shard_map,
+         mesh=mesh,
+         in_specs=(P('z', 'y'), P('y')),
+         out_specs=P('z', 'y'))
+def cic_read(mesh, positions):
+    """ Paints positions onto mesh
+  mesh: [nx, ny, nz]
+  positions: [npart, 3]
+  """
+    positions = jnp.expand_dims(positions, 1)
+    floor = jnp.floor(positions)
+    connection = jnp.array([[[0, 0, 0], [1., 0, 0], [0., 1, 0], [0., 0, 1],
+                             [1., 1, 0], [1., 0, 1], [0., 1, 1], [1., 1, 1]]])
+
+    neighboor_coords = floor + connection
+    kernel = 1. - jnp.abs(positions - neighboor_coords)
+    kernel = kernel[..., 0] * kernel[..., 1] * kernel[..., 2]
+
+    neighboor_coords = jnp.mod(neighboor_coords.astype('int32'),
+                               jnp.array(mesh.shape))
+
+    return (mesh[neighboor_coords[..., 0], neighboor_coords[..., 1],
+                 neighboor_coords[..., 3]] * kernel).sum(axis=-1)
+
+
+def make_ode_fn(mesh_shape):
+
+    def nbody_ode(state, a, cosmo, kvec):
+        """
+        state is a tuple (position, velocities)
+        """
+        pos, vel = state
+
+        ky, kz, kx = kvec
+        kk = jnp.sqrt((kx / box_size[0] * mesh_shape[0])**2 +
+                      (ky / box_size[1] * mesh_shape[1])**2 +
+                      (kz / box_size[1] * mesh_shape[1])**2)
+        mesh = cic_paint(pos)
+        delta_k = jaxdecomp.fft.pfft3d(mesh)
+
+        kernel_lap = jnp.where(kk == 0, 1.,
+                               1. / (kx**2 + ky**2 + kz**2))  # Laplace kernel
+
+        pot_k = delta_k * kernel_lap
+
+        forces_k = [
+            jaxdecomp.fft.pifft3d(pot_k * 1j / 6.0 *
+                                  (8 * jnp.sin(kx) - jnp.sin(2 * kx))).real,
+            jaxdecomp.fft.pifft3d(pot_k * 1j / 6.0 *
+                                  (8 * jnp.sin(ky) - jnp.sin(2 * ky))).real,
+            jaxdecomp.fft.pifft3d(pot_k * 1j / 6.0 *
+                                  (8 * jnp.sin(kz) - jnp.sin(2 * kz))).real
+        ]
+
+        forces = jnp.stack([cic_read(forces_k[i], pos) for i in range(3)],
+                           axis=-1)
+
+        # Computes the update of position (drift)
+        dpos = 1. / (a**3 * jnp.sqrt(jc.background.Esqr(cosmo, a))) * vel
+
+        # Computes the update of velocity (kick)
+        dvel = 1. / (a**2 * jnp.sqrt(jc.background.Esqr(cosmo, a))) * forces
+
+        return dpos, dvel
+
+    return nbody_ode
 
 
 @partial(shard_map, mesh=mesh, in_specs=(P('z', 'y'), ), out_specs=P('z', 'y'))
@@ -293,17 +360,25 @@ def forward_fn(z, kvec, a):
                            1. / (kx**2 + ky**2 + kz**2))  # Laplace kernel
     pot_k = delta_k * kernel_lap
     # Forces have to be a Z pencil because they are going to be IFFT back to X pencil
-    forces_k = jnp.stack([
-        pot_k * 1j / 6.0 *
-        (8 * jnp.sin(kx) - jnp.sin(2 * kx)), pot_k * 1j / 6.0 *
-        (8 * jnp.sin(ky) - jnp.sin(2 * ky)), pot_k * 1j / 6.0 *
-        (8 * jnp.sin(kz) - jnp.sin(2 * kz))
-    ],
-                         axis=-1)
+    forces_k = [
+        jaxdecomp.fft.pifft3d(pot_k * 1j / 6.0 *
+                              (8 * jnp.sin(kx) - jnp.sin(2 * kx))).real,
+        jaxdecomp.fft.pifft3d(pot_k * 1j / 6.0 *
+                              (8 * jnp.sin(ky) - jnp.sin(2 * ky))).real,
+        jaxdecomp.fft.pifft3d(pot_k * 1j / 6.0 *
+                              (8 * jnp.sin(kz) - jnp.sin(2 * kz))).real
+    ]
 
-    dx = growth_factor(cosmo, a) * jnp.stack(
-        [jaxdecomp.fft.pifft3d(forces_k[..., i]).real for i in range(3)],
-        axis=-1)
+    initial_forces = jnp.stack([cic_read(forces_k[i], pos) for i in range(3)],
+                               axis=-1)
+
+    dx = growth_factor(cosmo, a) * initial_forces
+
+    p = a**2 * growth_factor(cosmo, a) * jnp.sqrt(jc.background.Esqr(cosmo,
+                                                                     a)) * dx
+    f = a**2 * jnp.sqrt(jc.background.Esqr(cosmo, a)) * jc.background.dGfa(
+        cosmo, a) * initial_forces
+
     if lpt2:
         # Add second order lpt
         source_lpt2k = lpt2_source(pot_k, kvec)
@@ -334,7 +409,15 @@ def forward_fn(z, kvec, a):
     # Removing the padding
     field = unpad(field)
 
-    return initial_conditions, field
+    # return initial_conditions, field
+
+    res = odeint(make_ode_fn(mesh_shape), [pos + dx, p],
+                 snapshots,
+                 cosmo,
+                 kvec,
+                 rtol=1e-5,
+                 atol=1e-5)
+    return initial_conditions, res[-1]
 
 
 with mesh:
