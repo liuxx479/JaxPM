@@ -1,7 +1,5 @@
 import jax
 
-jax.config.update("jax_enable_x64", False)
-
 from jax.experimental.ode import odeint
 import diffrax
 from diffrax import diffeqsolve, ODETerm, PIDController, SaveAt
@@ -21,6 +19,7 @@ import jax_cosmo as jc
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, PartitionSpec as P
 from jaxpm.growth import growth_factor
+import jaxpm as jaxpm
 import time
 import argparse
 import os
@@ -48,6 +47,7 @@ def _chunk_split(ptcl_num, chunk_size, *arrays):
     ]
 
     return remainder, chunks
+
 
 def enmesh(i1, d1, a1, s1, b12, a2, s2):
     """Multilinear enmeshing."""
@@ -114,6 +114,7 @@ def enmesh(i1, d1, a1, s1, b12, a2, s2):
 
     return i2, f2
 
+
 def _scatter_chunk(carry, chunk):
     mesh, offset, cell_size = carry
     pmid, disp, val = chunk
@@ -129,6 +130,7 @@ def _scatter_chunk(carry, chunk):
 
     carry = mesh, offset, cell_size
     return carry, None
+
 
 def scatter(pmid,
             disp,
@@ -149,6 +151,7 @@ def scatter(pmid,
     carry = scan(_scatter_chunk, carry, chunks)[0]
     mesh = carry[0]
     return mesh
+
 
 def lpt2_source(lineark_laplace, kvec):
     ky, kz, kx = kvec
@@ -179,7 +182,10 @@ def lpt2_source(lineark_laplace, kvec):
 
     return jaxdecomp.fft.pfft3d(source * 3. / 7.)
 
+
 if __name__ == '__main__':
+
+    jax.config.update('jax_enable_x64', False)
 
     parser = argparse.ArgumentParser()
 
@@ -187,7 +193,9 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--pdims', type=str, default='1x1')
     parser.add_argument('-b', '--box_size', type=int, default=200)
     parser.add_argument('-hs', '--halo_size', type=int, default=0)
-    parser.add_argument('-o', '--output', type=str, default='.')
+    parser.add_argument('-ode', '--ode', type=str, choices=["diffrax" , "jax" , "manual" , "lpt"], default="lpt")
+    parser.add_argument('-o', '--output', type=str, default='out')
+
     parser.add_argument('--lpt2', action='store_true')
 
     args = parser.parse_args()
@@ -198,11 +206,17 @@ if __name__ == '__main__':
     # Rea
     pdims = tuple(map(int, args.pdims.split('x')))
     mesh_shape = [args.size, args.size, args.size]
-    box_size = [float(args.box_size), float(args.box_size), float(args.box_size)]
+    box_size = [
+        float(args.box_size),
+        float(args.box_size),
+        float(args.box_size)
+    ]
     halo_size = args.halo_size
     use_halo_exchange = True if halo_size > 0 else False
+
     lpt2 = args.lpt2
-    output_dir = f"{args.output}/mesh_{args.size}/pdims_{args.pdims}/box_{args.box_size}/halo_{args.halo_size}"
+    ode_str = args.ode
+    output_dir = f"{args.output}/mesh_{args.size}/pdims_{args.pdims}/box_{args.box_size}/halo_{args.halo_size}/{ode_str}"
     # Create output directory recursively
     os.makedirs(output_dir, exist_ok=True)
     snapshots = jnp.linspace(0.1, 1.0, 2)
@@ -257,14 +271,17 @@ if __name__ == '__main__':
         pmid = pmid.reshape([-1, 3])
         return scatter(pmid, displacement.reshape([-1, 3]), mesh)
 
+    @jax.jit
     def cic_paint(displacement):
+
+        print(f"Painting displacement {displacement.shape}")
 
         field = cic_paint_sharded(displacement)
 
         if use_halo_exchange:
             field = jaxdecomp.halo_exchange(field,
                                             halo_extents=(halo_size // 2,
-                                                        halo_size // 2, 0),
+                                                          halo_size // 2, 0),
                                             halo_periods=(True, True, True),
                                             reduce_halo=False)
             # Removing the padding
@@ -283,15 +300,15 @@ if __name__ == '__main__':
 
             ky, kz, kx = kvec
             kk = jnp.sqrt((kx / box_size[0] * mesh_shape[0])**2 +
-                        (ky / box_size[1] * mesh_shape[1])**2 +
-                        (kz / box_size[1] * mesh_shape[1])**2)
+                          (ky / box_size[1] * mesh_shape[1])**2 +
+                          (kz / box_size[1] * mesh_shape[1])**2)
 
             mesh = cic_paint(pos)
 
             delta_k = jaxdecomp.fft.pfft3d(mesh)
 
-            kernel_lap = jnp.where(kk == 0, 1.,
-                                1. / (kx**2 + ky**2 + kz**2))  # Laplace kernel
+            kernel_lap = jnp.where(kk == 0, 1., 1. /
+                                   (kx**2 + ky**2 + kz**2))  # Laplace kernel
             pot_k = delta_k * kernel_lap
 
             # Forces have to be a Z pencil because they are going to be IFFT back to X pencil
@@ -301,34 +318,52 @@ if __name__ == '__main__':
                 (8 * jnp.sin(ky) - jnp.sin(2 * ky)), pot_k * 1j / 6.0 *
                 (8 * jnp.sin(kz) - jnp.sin(2 * kz))
             ],
-                                axis=-1)
-            forces = jnp.stack(
-                [jaxdecomp.fft.pifft3d(forces_k[..., i]).real for i in range(3)],
-                axis=-1)
+                                 axis=-1)
+            forces = jnp.stack([
+                jaxdecomp.fft.pifft3d(forces_k[..., i]).real for i in range(3)
+            ],
+                               axis=-1)
 
             # Computes the update of position (drift)
             dpos = 1. / (a**3 * jnp.sqrt(jc.background.Esqr(cosmo, a))) * vel
 
             # Computes the update of velocity (kick)
-            dvel = 1. / (a**2 * jnp.sqrt(jc.background.Esqr(cosmo, a))) * forces
+            dvel = 1. / (a**2 *
+                         jnp.sqrt(jc.background.Esqr(cosmo, a))) * forces
 
-            return jnp.stack([dpos, dvel] , axis=0)
+            return jnp.stack([dpos, dvel], axis=0)
 
         return nbody_ode
 
     @partial(shard_map,
-         mesh=mesh,
-         in_specs=(P('z', 'y')),
-         out_specs=P('z', 'y'))
+             mesh=mesh,
+             in_specs=(P('z', 'y')),
+             out_specs=P('z', 'y'))
     def unpad(x):
         x = x.at[halo_size:halo_size + halo_size // 2].add(x[:halo_size // 2])
-        x = x.at[-(halo_size + halo_size // 2):-halo_size].add(x[-halo_size // 2:])
-        x = x.at[:,
-                halo_size:halo_size + halo_size // 2].add(x[:, :halo_size // 2])
-        x = x.at[:,
-                -(halo_size + halo_size // 2):-halo_size].add(x[:,
-                                                                -halo_size // 2:])
+        x = x.at[-(halo_size + halo_size // 2):-halo_size].add(x[-halo_size //
+                                                                 2:])
+        x = x.at[:, halo_size:halo_size + halo_size // 2].add(
+            x[:, :halo_size // 2])
+        x = x.at[:, -(halo_size + halo_size // 2):-halo_size].add(
+            x[:, -halo_size // 2:])
         return x[halo_size:-halo_size, halo_size:-halo_size, :]
+
+
+    @partial(shard_map,
+             mesh=mesh,
+             in_specs=(P('z', 'y'),P('z', 'y')),
+             out_specs=P('z', 'y'))
+    def interpolate(kfield , kk):
+        
+        k = jnp.logspace(-4, 2, 256)  # I don't understand why 256?
+        pk = jc.power.linear_matter_power(jc.Planck15(), k)
+        pk = pk * (mesh_shape[0] / box_size[0]) * (
+            mesh_shape[1] / box_size[1]) * (mesh_shape[2] / box_size[2])
+        delta_k = kfield * jc.scipy.interpolate.interp(
+            kk.flatten(), k, pk**0.5).reshape(kfield.shape)
+        
+        return delta_k
 
     @jax.jit
     def forward_fn(z, kvec, a):
@@ -339,12 +374,9 @@ if __name__ == '__main__':
                       (ky / box_size[1] * mesh_shape[1])**2 +
                       (kz / box_size[1] * mesh_shape[1])**2)
 
-        k = jnp.logspace(-4, 2, 256)  # I don't understand why 256?
-        pk = jc.power.linear_matter_power(jc.Planck15(), k)
-        pk = pk * (mesh_shape[0] / box_size[0]) * (
-            mesh_shape[1] / box_size[1]) * (mesh_shape[2] / box_size[2])
-        delta_k = kfield * jc.scipy.interpolate.interp(
-            kk.flatten(), k, pk**0.5).reshape(kfield.shape)
+
+        delta_k = interpolate(kfield,kk) 
+
 
         # Inverse fourier transform to generate the initial conditions
         initial_conditions = jaxdecomp.fft.pifft3d(delta_k).real
@@ -369,9 +401,7 @@ if __name__ == '__main__':
             [jaxdecomp.fft.pifft3d(forces_k[..., i]).real for i in range(3)],
             axis=-1)
 
-        dx = growth_factor(cosmo, a) * jnp.stack(
-            [jaxdecomp.fft.pifft3d(forces_k[..., i]).real for i in range(3)],
-            axis=-1)
+        dx = growth_factor(cosmo, a) * init_force
 
         p = a**2 * growth_factor(cosmo, a) * jnp.sqrt(
             jc.background.Esqr(cosmo, a)) * dx
@@ -396,58 +426,97 @@ if __name__ == '__main__':
 
         field = cic_paint(dx)
 
-        # return initial_conditions, field, None , None
-        
-        ode_fn = make_ode_fn(mesh_shape)
+        if args.ode == "lpt":
+            return initial_conditions, field, None
 
-        term = ODETerm(
-            lambda t, state, args: ode_fn(state, t, args))
-        solver = diffrax.Dopri5()
+        elif args.ode == "jax":
 
-        stepsize_controller = diffrax.ConstantStepSize()
-        res = diffeqsolve(term,
-                          solver,
-                          t0=0.1,
-                          t1=1.,
-                          dt0=0.01,
-                          y0=jnp.stack([dx, p], axis=0),
-                          args=(cosmo, kvec),
-                          saveat=SaveAt(ts=[0.5 , 1]),
-                          stepsize_controller=stepsize_controller)
+            ode_fn = jaxpm.pm.make_ode_fn(mesh_shape)
+            res = odeint(ode_fn, [dx, p], jnp.array([0.1, 1.]),cosmo , rtol=1e-3, atol=1e-3)
 
-        print(f"shape {res.ys[0,0]}")
+            final_particles = [ode_field for ode_field in res[0]]
 
-        final_fields = [cic_paint(ode_field[0]) for ode_field in res.ys]
-        return initial_conditions, field, final_fields , res
+            return initial_conditions, field, final_particles
 
-    with mesh:
+        elif args.ode == "diffrax":
+
+            ode_fn = make_ode_fn(mesh_shape)
+
+            term = ODETerm(lambda t, state, args: ode_fn(state, t, args))
+            solver = diffrax.Euler()
+
+            stepsize_controller = diffrax.ConstantStepSize()
+            res = diffeqsolve(term,
+                            solver,
+                            t0=0.1,
+                            t1=1.,
+                            dt0=0.01,
+                            y0=jnp.stack([dx, p], axis=0),
+                            args=(cosmo, kvec),
+                            stepsize_controller=stepsize_controller)
+            
+            final_fields = [ode_field[0] for ode_field in res.ys]
+
+            return initial_conditions, field, final_fields
+
+
+        elif args.ode == "manual":
+            ode_fn = make_ode_fn(mesh_shape)
+
+            state = jnp.stack([dx, p], axis=0)
+            final_fields = []
+            min_step = 0.01
+            max_step = 1.
+            nb_steps = 10
+            steps = jnp.linspace(min_step, max_step, nb_steps)
+            snapshots = jnp.linspace(0.1, 1.0, 10)
+            step_size = steps[1] - steps[0]
+            for step in steps:
+                state = state + ode_fn(state, step, [cosmo, kvec])  * step_size
+                final_fields.append(state[0])
+                print(f"Doing step {step}")
+
+            return initial_conditions, field, final_fields
+
+
+
+    with mesh :
         jit_start = time.perf_counter()
-        initial_conds, field, final_fields , res = forward_fn(z, kvec, a=1.)
+        initial_conds, field, final_fields = forward_fn(z, kvec, a=1.)
         field.block_until_ready()
         jit_end = time.perf_counter()
+        # del initial_conds, field, final_fields, res
 
         start = time.perf_counter()
-        initial_conds, field, final_fields , res = forward_fn(z, kvec, a=1.)
+        initial_conds, field, final_fields = forward_fn(z, kvec, a=1.)
         field.block_until_ready()
         end = time.perf_counter()
 
-    with open(f"{output_dir}/log_{rank}.txt", 'w') as log_file:
+        # hlo = jax.jit(forward_fn).lower(z, kvec, a=1.).compile().runtime_executable().hlo_modules()[0].to_string()
+        # print(hlo)
+
+    with open(f"{output_dir}/log_{rank}.log", 'w') as log_file:
         log_file.write(f"JIT time: {jit_end - jit_start}\n")
         log_file.write(f"Execution time: {end - start}\n")
-        log_file.write("Solver stat")
-        print(res.stats , file=log_file)
+        # log_file.write("Solver stat")
+        # print(res.stats, file=log_file)
     # Saving results
     np.save(f'{output_dir}/initial_conditions_{rank}.npy',
-            initial_conds.addressable_data(0).astype('float16'))
-    np.save(f'{output_dir}/field_{rank}.npy',
-            field.addressable_data(0).astype('float16'))
+            initial_conds.addressable_data(0))
+    np.save(f'{output_dir}/field_{rank}.npy', field.addressable_data(0))
 
-    for i, final_field in enumerate(final_fields):
+    print(f"final_fields {final_fields}")
+    if final_fields is not None:
+        for i, final_field in enumerate(final_fields):
 
-        np.save(f'{output_dir}/ode_solution_{i}_{rank}.npy',
-                res.ys[i,0].addressable_data(0).astype('float16'))
-        np.save(f'{output_dir}/final_field_{i}_{rank}.npy',
-                final_field.addressable_data(0).astype('float16'))
+            with mesh:
+                final_field_mesh = cic_paint(final_field)
+            np.save(f'{output_dir}/ode_solution_{i}_{rank}.npy',
+                    final_field_mesh.addressable_data(0))
+            np.save(f'{output_dir}/final_field_{i}_{rank}.npy',
+                    final_field_mesh.addressable_data(0))
 
-jaxdecomp.finalize()
+    print(f"Finished saved to {output_dir}")
+
+# jaxdecomp.finalize()
 jax.distributed.shutdown()
